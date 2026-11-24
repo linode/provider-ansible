@@ -1,0 +1,381 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+    tags:
+      - 'v*'
+  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      xpkg_reg_orgs:
+        description: >-
+          Publish the package to these registry orgs, space separated (e.g. ghcr.io/my-org).
+          Defaults to the XPKG_REG_ORGS repository variable; forks publish only when one is set.
+        required: false
+        default: ''
+      version:
+        description: 'Version to build and publish (default: the tag being built, or derived from git describe)'
+        required: false
+        default: ''
+
+env:
+  # Common versions
+  GO_VERSION: '1.24.13'
+  GOLANGCI_VERSION: 'v2.5'
+  DOCKER_BUILDX_VERSION: 'v0.31.1'
+
+  # Common users. We can't run a step 'if secrets.AWS_USR != ""' but we can run
+  # a step 'if env.AWS_USR' != ""', so we copy these to succinctly test whether
+  # credentials have been provided before trying to run steps that need them.
+  CONTRIB_DOCKER_USR: ${{ secrets.CONTRIB_DOCKER_USR }}
+  XPKG_ACCESS_ID: ${{ secrets.XPKG_ACCESS_ID }}
+
+jobs:
+  detect-noop:
+    runs-on: ubuntu-22.04
+    outputs:
+      noop: ${{ steps.noop.outputs.should_skip }}
+    steps:
+      - name: Detect No-op Changes
+        id: noop
+        uses: fkirc/skip-duplicate-actions@v5.3.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          paths_ignore: '["**.md", "**.png", "**.jpg"]'
+          do_not_skip: '["workflow_dispatch", "schedule", "push"]'
+          concurrent_skipping: false
+
+
+  lint:
+    runs-on: ubuntu-22.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Find the Go Build Cache
+        id: go
+        run: echo "::set-output name=cache::$(make go.cachedir)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: ${{ runner.os }}-build-lint-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-build-lint-
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v5
+        with:
+          path: .work/pkg
+          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-pkg-
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      # We could run 'make lint' to ensure our desired Go version, but we prefer
+      # this action because it leaves 'annotations' (i.e. it comments on PRs to
+      # point out linter violations).
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          args: --timeout=10m0s
+          version: ${{ env.GOLANGCI_VERSION }}
+          skip-go-installation: true
+
+  check-diff:
+    runs-on: ubuntu-22.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Find the Go Build Cache
+        id: go
+        run: echo "::set-output name=cache::$(make go.cachedir)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: ${{ runner.os }}-build-check-diff-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-build-check-diff-
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v5
+        with:
+          path: .work/pkg
+          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-pkg-
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Check Diff
+        run: make check-diff
+
+  unit-tests:
+    runs-on: ubuntu-22.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Find the Go Build Cache
+        id: go
+        run: echo "::set-output name=cache::$(make go.cachedir)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: ${{ runner.os }}-build-unit-tests-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-build-unit-tests-
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v5
+        with:
+          path: .work/pkg
+          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-pkg-
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Run Unit Tests
+        run: make -j2 test
+
+      - name: Publish Unit Test Coverage
+        uses: codecov/codecov-action@v5
+        with:
+          flags: unittests
+          file: _output/tests/linux_amd64/coverage.txt
+
+  e2e-tests:
+    runs-on: ubuntu-22.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.DOCKER_BUILDX_VERSION }}
+          install: true
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Find the Go Build Cache
+        id: go
+        run: echo "::set-output name=cache::$(make go.cachedir)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: ${{ runner.os }}-build-e2e-tests-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-build-e2e-tests-
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v5
+        with:
+          path: .work/pkg
+          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-pkg-
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Build Helm Chart
+        run: make -j2 build
+        env:
+          # We're using docker buildx, which doesn't actually load the images it
+          # builds by default. Specifying --load does so.
+          BUILD_ARGS: "--load"
+
+      - name: Run E2E Tests
+        run: make e2e USE_HELM3=true
+
+  publish-artifacts:
+    runs-on: ubuntu-22.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # Publishing to the registries given by the xpkg_reg_orgs input or the
+      # XPKG_REG_ORGS repository variable, e.g. a fork's ghcr.io/<org>. Only
+      # for manual runs and tag pushes; a tag publishes as its own version.
+      - name: Configure Publishing to Given Registries
+        id: given
+        env:
+          INPUT_XPKG_REG_ORGS: ${{ inputs.xpkg_reg_orgs || vars.XPKG_REG_ORGS }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          orgs="" version="$INPUT_VERSION"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || "$GITHUB_REF" == refs/tags/* ]]; then
+            orgs="$INPUT_XPKG_REG_ORGS"
+          fi
+          if [[ -n "$orgs" && -z "$version" && "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          fi
+          if [[ -n "$orgs" ]]; then
+            if [[ ! "$orgs" =~ ^[a-z0-9][a-z0-9./:_-]*( [a-z0-9][a-z0-9./:_-]*)*$ ]]; then
+              echo "::error::registry orgs must be space separated, like ghcr.io/my-org, got '$orgs'"
+              exit 1
+            fi
+            echo "XPKG_REG_ORGS=$orgs" >> "$GITHUB_ENV"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -n "$version" ]]; then
+            if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$ ]]; then
+              echo "::error::version must look like v1.2.3 or v1.2.3-suffix, got '$version'"
+              exit 1
+            fi
+            echo "VERSION=$version" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.DOCKER_BUILDX_VERSION }}
+          install: true
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Find the Go Build Cache
+        id: go
+        run: echo "::set-output name=cache::$(make go.cachedir)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: ${{ runner.os }}-build-publish-artifacts-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-build-publish-artifacts-
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v5
+        with:
+          path: .work/pkg
+          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-pkg-
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Build Artifacts
+        run: make -j2 build.all
+        env:
+          # We're using docker buildx, which doesn't actually load the images it
+          # builds by default. Specifying --load does so.
+          BUILD_ARGS: "--load"
+
+      - name: Publish Artifacts to GitHub
+        uses: actions/upload-artifact@v6
+        with:
+          name: output
+          path: _output/**
+
+      - name: Login to Docker
+        uses: docker/login-action@v3
+        if: env.CONTRIB_DOCKER_USR != ''
+        with:
+          username: ${{ secrets.CONTRIB_DOCKER_USR }}
+          password: ${{ secrets.CONTRIB_DOCKER_PSW }}
+
+      - name: Login to GHCR using PAT
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Artifacts to S3 and Docker Hub
+        run: make -j2 publish BRANCH_NAME=${GITHUB_REF##*/}
+        if: env.CONTRIB_DOCKER_USR != '' && steps.given.outputs.publish != 'true'
+        env:
+          GIT_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCS_GIT_USR: ${{ secrets.UPBOUND_BOT_GITHUB_USR }}
+          DOCS_GIT_PSW: ${{ secrets.UPBOUND_BOT_GITHUB_PSW }}
+
+      - name: Publish Package to Given Registries
+        if: steps.given.outputs.publish == 'true'
+        run: make version.isdirty xpkg.release.publish
+
+      - name: Promote Artifacts in S3 and Docker Hub
+        if: github.ref == 'refs/heads/main' && env.CONTRIB_DOCKER_USR != '' && steps.given.outputs.publish != 'true'
+        run: make -j2 promote
+        env:
+          BRANCH_NAME: main
+          CHANNEL: main
